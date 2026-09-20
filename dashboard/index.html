@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Airport Washroom Monitor</title>
+    <style>
+      :root { --ink: #17212b; --muted: #627081; --panel: #ffffff; --ground: #f3f6f8; --blue: #2463a8; --red: #b42318; --amber: #b54708; --green: #027a48; }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--ground); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+      header { padding: 30px max(28px, calc((100vw - 1180px) / 2)); background: #102a43; color: #fff; }
+      h1 { margin: 0; font-size: 28px; }
+      header p { margin: 6px 0 0; color: #d9e2ec; }
+      main { max-width: 1180px; margin: 26px auto 50px; padding: 0 20px; }
+      .metrics { display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 14px; margin-bottom: 22px; }
+      .card, section { background: var(--panel); border: 1px solid #d9e2ec; border-radius: 10px; box-shadow: 0 1px 2px rgb(16 42 67 / 6%); }
+      .card { padding: 17px; }
+      .metric-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+      .metric-value { margin-top: 5px; font-size: 24px; font-weight: 700; }
+      section { margin-top: 20px; overflow: hidden; }
+      section h2 { margin: 0; padding: 16px 18px; border-bottom: 1px solid #e6edf3; font-size: 18px; }
+      .content { padding: 0 18px 18px; overflow-x: auto; }
+      table { width: 100%; border-collapse: collapse; min-width: 850px; }
+      th, td { padding: 11px 9px; border-bottom: 1px solid #e6edf3; text-align: left; white-space: nowrap; }
+      th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+      .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+      .immediate { color: var(--red); background: #fef3f2; }
+      .cleaning, .refill { color: var(--amber); background: #fffaeb; }
+      .normal { color: var(--green); background: #ecfdf3; }
+      .priority-immediate { color: #fff; background: var(--red); }
+      .priority-high { color: #7a2e0e; background: #fedf89; }
+      .priority-medium { color: #6941c6; background: #f4f3ff; }
+      #updated { color: #d9e2ec; font-size: 13px; }
+      .controls { margin-top: 16px; display: flex; align-items: center; gap: 12px; }
+      button { border: 0; border-radius: 7px; padding: 9px 15px; background: #fff; color: #102a43; font-weight: 700; cursor: pointer; }
+      button.playing { background: #f97066; color: #fff; }
+      #live-state { font-size: 13px; color: #d9e2ec; }
+      .live-grid { display: grid; grid-template-columns: repeat(4, minmax(155px, 1fr)); gap: 12px; padding: 18px; }
+      .live-value { margin-top: 4px; font-size: 18px; font-weight: 700; }
+      .live-action { grid-column: 1 / -1; padding: 12px; border-radius: 7px; background: #f8fafc; }
+      @media (max-width: 860px) { .metrics { grid-template-columns: repeat(2, 1fr); } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Airport washroom monitoring</h1>
+      <p>10 washrooms · synthetic five-minute IoT telemetry · <span id="updated">Loading…</span></p>
+      <div class="controls"><button id="play" type="button">▶ Play test-data feed</button><span id="live-state">Feed paused</span></div>
+    </header>
+    <main>
+      <div class="metrics" id="metrics"></div>
+
+      <section>
+        <h2>Live sensor broadcast</h2>
+        <div class="live-grid" id="live-reading"><div>Press Play to sample a random held-out test reading and score it live.</div></div>
+      </section>
+
+      <section>
+        <h2>Active dispatch tickets</h2>
+        <div class="content"><table id="tickets"></table></div>
+      </section>
+
+      <section>
+        <h2>Latest washroom status</h2>
+        <div class="content"><table id="washrooms"></table></div>
+      </section>
+    </main>
+    <script>
+      const percentage = value => `${Math.round(value * 100)}%`;
+      const litres = value => `${Number(value).toLocaleString()} L`;
+      const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      const statusClass = status => status === 'Immediate attention' ? 'immediate' : status === 'Cleaning needed' ? 'cleaning' : status === 'Refill needed' ? 'refill' : 'normal';
+      const priorityClass = priority => `priority-${priority.toLowerCase()}`;
+
+      const state = { data: null, stream: [], models: null, timer: null, liveRooms: new Map(), samples: 0 };
+      const clamp = value => Math.max(0, Math.min(1, value));
+      const logistic = value => 1 / (1 + Math.exp(-Math.max(-35, Math.min(35, value))));
+
+      function scoreLinear(spec, values, probability = false) {
+        const score = spec.intercept + spec.coefficients.reduce((total, coefficient, index) => total + coefficient * ((values[index] - spec.mean[index]) / spec.scale[index]), 0);
+        return probability ? logistic(score) : score;
+      }
+
+      function featureValue(sample, name) {
+        if (name === 'restroom_number') return Number(sample.restroom_id.replace('R', ''));
+        if (name === 'expected_passenger_volume') return sample.passenger_volume;
+        const time = new Date(sample.timestamp);
+        const hour = time.getHours() + time.getMinutes() / 60;
+        const weekday = (time.getDay() + 6) % 7;
+        if (name === 'hour_sin') return Math.sin(2 * Math.PI * hour / 24);
+        if (name === 'hour_cos') return Math.cos(2 * Math.PI * hour / 24);
+        if (name === 'weekday_sin') return Math.sin(2 * Math.PI * weekday / 7);
+        if (name === 'weekday_cos') return Math.cos(2 * Math.PI * weekday / 7);
+        return Number(sample[name]);
+      }
+
+      function scoreSample(sample) {
+        const cleaningValues = state.models.cleaning.features.map(name => featureValue(sample, name));
+        const waterValues = state.models.water.features.map(name => featureValue(sample, name));
+        const flowExcess = Math.max(0, sample.flow_rate_lpm - sample.expected_flow_lpm);
+        const persistent = clamp((sample.persistent_excess_lpm - .18) / .65);
+        const excess = clamp((flowExcess - .20) / .9);
+        const pressure = clamp((3.05 - sample.water_pressure_bar) / .5);
+        const leak = clamp(.68 * persistent + .22 * excess + .10 * pressure);
+        const cleaning = scoreLinear(state.models.cleaning, cleaningValues, true);
+        const water = Math.max(0, scoreLinear(state.models.water, waterValues));
+        const consumable = Math.min(sample.soap_level_pct, sample.sanitizer_level_pct, sample.paper_towel_level_pct);
+        const refill = clamp((25 - consumable) / 25);
+        let action = 'Normal monitoring';
+        if (leak >= .75) action = 'Dispatch technician immediately';
+        else if (cleaning >= .70) action = 'Add to cleaner route';
+        else if (refill >= .20 || sample.refill_required_within_shift) action = 'Add consumables to cleaner route';
+        return { ...sample, flowExcess, leak_probability: leak, cleaning_probability: cleaning, refill_risk: refill, predicted_water_litres_5min: water, action };
+      }
+
+      function renderLive(reading) {
+        const cells = [
+          ['Test reading', `${reading.restroom_id} · ${new Date(reading.timestamp).toLocaleString()}`],
+          ['Flow / pressure', `${reading.flow_rate_lpm.toFixed(2)} L/min · ${reading.water_pressure_bar.toFixed(2)} bar`],
+          ['Leak probability', percentage(reading.leak_probability)],
+          ['Cleaning probability', percentage(reading.cleaning_probability)],
+          ['Refill risk', percentage(reading.refill_risk)],
+          ['Water prediction', `${reading.predicted_water_litres_5min.toFixed(1)} L / 5 min`],
+          ['Bin / odor', `${reading.bin_fill_pct.toFixed(0)}% · ${reading.odor_voc_ppb.toFixed(0)} ppb`],
+          ['Samples this session', state.samples]
+        ];
+        document.getElementById('live-reading').innerHTML = `${cells.map(([label, value]) => `<div class="card"><div class="metric-label">${label}</div><div class="live-value">${esc(value)}</div></div>`).join('')}<div class="live-action"><strong>Recommended action:</strong> ${esc(reading.action)}</div>`;
+      }
+
+      function renderTables() {
+        const data = state.data;
+        const summary = data.summary;
+        document.getElementById('updated').textContent = `data as of ${new Date(data.data_as_of).toLocaleString()}`;
+        document.getElementById('metrics').innerHTML = [
+          ['Washrooms monitored', summary.washrooms_monitored],
+          ['Immediate leak tickets', summary.immediate_leak_tickets],
+          ['Cleaning tickets', summary.cleaning_tickets],
+          ['Refill tickets', summary.refill_tickets],
+          ['Next 24h water forecast', litres(summary.next_day_litres)]
+        ].map(([label, value]) => `<div class="card"><div class="metric-label">${label}</div><div class="metric-value">${value}</div></div>`).join('');
+
+        document.getElementById('tickets').innerHTML = `<thead><tr><th>Ticket</th><th>Washroom</th><th>Issue</th><th>Priority</th><th>Confidence</th><th>Recommended action</th><th>Evidence</th></tr></thead><tbody>${data.tickets.map(ticket => `<tr><td>${esc(ticket.ticket_id)}</td><td>${esc(ticket.restroom_id)}</td><td>${esc(ticket.issue_type)}</td><td><span class="badge ${priorityClass(ticket.priority)}">${esc(ticket.priority)}</span></td><td>${percentage(ticket.confidence)}</td><td>${esc(ticket.recommended_action)}</td><td>${esc(ticket.evidence)}</td></tr>`).join('') || '<tr><td colspan="7">No active tickets.</td></tr>'}</tbody>`;
+
+        const rooms = data.washrooms.map(room => state.liveRooms.get(room.restroom_id) || room);
+        document.getElementById('washrooms').innerHTML = `<thead><tr><th>Washroom</th><th>Status</th><th>Passengers</th><th>Flow</th><th>Pressure</th><th>Tank</th><th>Soap</th><th>Paper</th><th>Bin</th><th>Odor</th><th>Leak risk</th><th>Cleaning risk</th><th>Minutes since clean</th></tr></thead><tbody>${rooms.map(room => { const status = room.action === 'Dispatch technician immediately' ? 'Immediate attention' : room.action === 'Add to cleaner route' ? 'Cleaning needed' : room.action === 'Add consumables to cleaner route' ? 'Refill needed' : room.status || 'Normal'; return `<tr><td>${esc(room.restroom_id)}</td><td><span class="badge ${statusClass(status)}">${esc(status)}</span></td><td>${room.passenger_volume}</td><td>${room.flow_rate_lpm.toFixed(2)} L/min</td><td>${room.water_pressure_bar.toFixed(2)} bar</td><td>${room.water_tank_level_pct.toFixed(0)}%</td><td>${room.soap_level_pct.toFixed(0)}%</td><td>${room.paper_towel_level_pct.toFixed(0)}%</td><td>${room.bin_fill_pct.toFixed(0)}%</td><td>${room.odor_voc_ppb.toFixed(0)} ppb</td><td>${percentage(room.leak_probability)}</td><td>${percentage(room.cleaning_probability)}</td><td>${room.last_cleaned_minutes_ago}</td></tr>`; }).join('')}</tbody>`;
+      }
+
+      function nextSample() {
+        const sample = state.stream[Math.floor(Math.random() * state.stream.length)];
+        const reading = scoreSample(sample); state.samples += 1; state.liveRooms.set(reading.restroom_id, reading);
+        renderLive(reading); renderTables();
+      }
+      function toggleFeed() {
+        const button = document.getElementById('play');
+        if (state.timer) { clearInterval(state.timer); state.timer = null; button.textContent = '▶ Play test-data feed'; button.classList.remove('playing'); document.getElementById('live-state').textContent = 'Feed paused'; return; }
+        nextSample(); state.timer = setInterval(nextSample, 1000); button.textContent = '❚❚ Pause feed'; button.classList.add('playing'); document.getElementById('live-state').textContent = 'Streaming random held-out test data every second';
+      }
+      Promise.all([fetch('../outputs/dashboard_data.json'), fetch('../outputs/live_test_stream.json'), fetch('../outputs/live_models.json')])
+        .then(async responses => { if (responses.some(response => !response.ok)) throw new Error('Run the analytics pipeline first.'); return Promise.all(responses.map(response => response.json())); })
+        .then(([data, stream, models]) => { state.data = data; state.stream = stream; state.models = models; renderTables(); document.getElementById('play').addEventListener('click', toggleFeed); })
+        .catch(error => { document.querySelector('main').innerHTML = `<section><h2>Dashboard data unavailable</h2><div class="content"><p>${esc(error.message)}</p></div></section>`; });
+    </script>
+  </body>
+</html>
